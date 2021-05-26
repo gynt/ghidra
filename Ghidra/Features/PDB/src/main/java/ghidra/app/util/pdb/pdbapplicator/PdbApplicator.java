@@ -25,6 +25,7 @@ import ghidra.app.util.bin.format.pdb.PdbParserConstants;
 import ghidra.app.util.bin.format.pdb2.pdbreader.*;
 import ghidra.app.util.bin.format.pdb2.pdbreader.symbol.*;
 import ghidra.app.util.bin.format.pdb2.pdbreader.type.AbstractMsType;
+import ghidra.app.util.bin.format.pe.cli.tables.CliAbstractTableRow;
 import ghidra.app.util.importer.MessageLog;
 import ghidra.app.util.pdb.PdbCategories;
 import ghidra.app.util.pdb.pdbapplicator.SymbolGroup.AbstractMsSymbolIterator;
@@ -37,7 +38,6 @@ import ghidra.program.model.data.*;
 import ghidra.program.model.lang.Register;
 import ghidra.program.model.listing.*;
 import ghidra.program.model.symbol.*;
-import ghidra.util.InvalidNameException;
 import ghidra.util.Msg;
 import ghidra.util.exception.*;
 import ghidra.util.task.CancelOnlyWrappingTaskMonitor;
@@ -65,7 +65,6 @@ import ghidra.util.task.TaskMonitor;
 public class PdbApplicator {
 
 	private static final String THUNK_NAME_PREFIX = "[thunk]:";
-	private static final SymbolPath DUMMY_SYMBOL_PATH = new SymbolPath("/");
 
 	//==============================================================================================
 	/**
@@ -124,6 +123,8 @@ public class PdbApplicator {
 	private PdbAddressManager pdbAddressManager;
 	private List<SymbolGroup> symbolGroups;
 
+	private PdbCliInfoManager pdbCliManagedInfoManager;
+
 	//==============================================================================================
 	// If we have symbols and memory with VBTs in them, then a better VbtManager is created.
 	VbtManager vbtManager;
@@ -141,16 +142,9 @@ public class PdbApplicator {
 	 * <PRE>
 	 *   false = simple namespace
 	 *   true = class namespace
-	 *  </PRE> 
+	 *  </PRE>
 	 */
 	private Map<SymbolPath, Boolean> isClassByNamespace;
-
-	/**
-	 * Map for tracking use of procedure type records by function symbols.
-	 * If a type record is used more than once it will get mapped to the
-	 * {@link #DUMMY_SYMBOL_PATH} to indicate non-unique use.
-	 */
-	private Map<RecordNumber, SymbolPath> procedureSymbolNameMap;
 
 	//==============================================================================================
 	private SymbolApplierFactory symbolApplierParser;
@@ -198,23 +192,23 @@ public class PdbApplicator {
 		initializeApplyTo(programParam, dataTypeManagerParam, imageBaseParam,
 			applicatorOptionsParam, monitorParam, logParam);
 
-		switch (applicatorOptions.getRestrictions()) {
+		switch (applicatorOptions.getProcessingControl()) {
 			case DATA_TYPES_ONLY:
 				processTypes();
 				break;
 			case PUBLIC_SYMBOLS_ONLY:
 				processPublicSymbols();
 				break;
-			case NONE:
+			case ALL:
 				processTypes();
 				processSymbols();
-				renameAnonymousFunctions();
 				break;
 			default:
-				throw new PdbException("Invalid Restriction");
+				throw new PdbException("PDB: Invalid Application Control: " +
+					applicatorOptions.getProcessingControl());
 		}
 
-		if (program == null) {
+		if (program != null) {
 			Options options = program.getOptions(Program.PROGRAM_INFO);
 			options.setBoolean(PdbParserConstants.PDB_LOADED, true);
 		}
@@ -318,6 +312,9 @@ public class PdbApplicator {
 		pdbApplicatorMetrics = new PdbApplicatorMetrics();
 
 		pdbAddressManager = new PdbAddressManager(this, imageBase);
+
+		pdbCliManagedInfoManager = new PdbCliInfoManager(this);
+
 		symbolGroups = createSymbolGroups();
 
 		categoryUtils = setPdbCatogoryUtils(pdbFilename);
@@ -326,7 +323,6 @@ public class PdbApplicator {
 		complexApplierMapper = new ComplexTypeApplierMapper(this);
 		applierDependencyGraph = new JungDirectedGraph<>();
 		isClassByNamespace = new TreeMap<>();
-		procedureSymbolNameMap = new HashMap<>();
 		if (program != null) {
 			// Currently, this must happen after symbolGroups are created.
 			PdbVbtManager pdbVbtManager = new PdbVbtManager(this);
@@ -356,15 +352,16 @@ public class PdbApplicator {
 		if (programParam == null) {
 			if (dataTypeManagerParam == null) {
 				throw new PdbException(
-					"programParam and dataTypeManagerParam may not both be null.");
+					"PDB: programParam and dataTypeManagerParam may not both be null.");
 			}
 			if (imageBaseParam == null) {
-				throw new PdbException("programParam and imageBaseParam may not both be null.");
-			}
-			if (applicatorOptions.getRestrictions() != PdbApplicatorRestrictions.DATA_TYPES_ONLY) {
 				throw new PdbException(
-					"programParam may not be null for the chosen PdbApplicatorRestrictions: " +
-						applicatorOptions.getRestrictions());
+					"PDB: programParam and imageBaseParam may not both be null.");
+			}
+			if (applicatorOptions.getProcessingControl() != PdbApplicatorControl.DATA_TYPES_ONLY) {
+				throw new PdbException(
+					"PDB: programParam may not be null for the chosen Applicator Control: " +
+						applicatorOptions.getProcessingControl());
 			}
 		}
 		monitor = (monitorParam != null) ? monitorParam : TaskMonitor.DUMMY;
@@ -425,6 +422,14 @@ public class PdbApplicator {
 	}
 
 	/**
+	 * Returns the MessageLog.
+	 * @return the MessageLog
+	 */
+	MessageLog getMessageLog() {
+		return log;
+	}
+
+	/**
 	 * Puts message to {@link PdbLog} and to Msg.info()
 	 * @param originator a Logger instance, "this", or YourClass.class
 	 * @param message the message to display
@@ -480,7 +485,7 @@ public class PdbApplicator {
 	// Information for a putative PdbTypeApplicator:
 
 	/**
-	 * Returns the {@link DataTypeManager} associated with this analyzer. 
+	 * Returns the {@link DataTypeManager} associated with this analyzer.
 	 * @return DataTypeManager which this analyzer is using.
 	 */
 	DataTypeManager getDataTypeManager() {
@@ -512,8 +517,8 @@ public class PdbApplicator {
 
 	/**
 	 * Returns the {@link CategoryPath} for a typedef with with the give {@link SymbolPath} and
-	 * module number; 1 <= moduleNumber <= {@link PdbDebugInfo#getNumModules()}, 
-	 * except that modeleNumber of 0 represents publics/globals. 
+	 * module number; 1 <= moduleNumber <= {@link PdbDebugInfo#getNumModules()},
+	 * except that modeleNumber of 0 represents publics/globals.
 	 * @param moduleNumber module number
 	 * @param symbolPath SymbolPath of the symbol
 	 * @return the CategoryPath
@@ -638,7 +643,7 @@ public class PdbApplicator {
 				return sectionContribution.getModule();
 			}
 		}
-		throw new PdbException("Module not found for section/offset");
+		throw new PdbException("PDB: Module not found for section/offset");
 	}
 
 	//==============================================================================================
@@ -921,6 +926,23 @@ public class PdbApplicator {
 	}
 
 	//==============================================================================================
+	// CLI-Managed infor methods.
+	//==============================================================================================
+	// Currently in CLI, but could move.
+	boolean isDll() {
+		return pdbCliManagedInfoManager.isDll();
+	}
+
+	// Currently in CLI, but could move.
+	boolean isAslr() {
+		return pdbCliManagedInfoManager.isAslr();
+	}
+
+	CliAbstractTableRow getCliTableRow(int tableNum, int rowNum) throws PdbException {
+		return pdbCliManagedInfoManager.getCliTableRow(tableNum, rowNum);
+	}
+
+	//==============================================================================================
 	// Virtual-Base-Table-related methods.
 	//==============================================================================================
 	VbtManager getVbtManager() {
@@ -928,7 +950,7 @@ public class PdbApplicator {
 	}
 
 	//==============================================================================================
-	// 
+	//
 	//==============================================================================================
 	Register getRegister(String pdbRegisterName) {
 		return registerNameToRegisterMapper.getRegister(pdbRegisterName);
@@ -1150,7 +1172,7 @@ public class PdbApplicator {
 				num++;
 			}
 		}
-		appendLogMsg("Not processing linker symbols because linker module not found");
+		pdbLogAndInfoMessage(this, "Not processing linker symbols because linker module not found");
 		return -1;
 	}
 
@@ -1244,74 +1266,6 @@ public class PdbApplicator {
 			// skipping symbol
 			Msg.info(this, "Error applying symbol to program: " + e.toString());
 		}
-	}
-
-	void addFunctionUse(AbstractProcedureMsSymbol procedureSymbol, SymbolPath symbolPath) {
-		RecordNumber rn = procedureSymbol.getTypeRecordNumber();
-		SymbolPath n = procedureSymbolNameMap.get(rn);
-		if (n == null) {
-			procedureSymbolNameMap.put(rn, symbolPath);
-		}
-		else if (!symbolPath.equals(n)) {
-			procedureSymbolNameMap.put(rn, DUMMY_SYMBOL_PATH);
-		}
-	}
-
-	private void renameAnonymousFunctions() throws CancelledException {
-
-		monitor.setMessage("Renaming function definitions...");
-		monitor.setProgress(0);
-		monitor.setMaximum(procedureSymbolNameMap.size());
-		int cnt = 0;
-		int renamedCnt = 0;
-
-		for (RecordNumber rn : procedureSymbolNameMap.keySet()) {
-			monitor.checkCanceled();
-			monitor.setProgress(++cnt);
-			SymbolPath symbolPath = procedureSymbolNameMap.get(rn);
-			if (symbolPath != DUMMY_SYMBOL_PATH) {
-				// unique name exists for function definition (single use)
-				MsTypeApplier typeApplier = getTypeApplier(rn);
-				DataType dt = typeApplier.getDataType();
-				CategoryPath category = categoryUtils.getCategory(symbolPath.getParent());
-				Category newCategory = dataTypeManager.createCategory(category);
-				String newName = symbolPath.getName();
-
-				try {
-					if (newCategory.getDataType(newName) == null) {
-						// fast approach should generally work
-						dt.setName(newName);
-						dt.setCategoryPath(category);
-					}
-					else {
-						// use slow approach if conflict exists
-						DataType newDt = dt.copy(dataTypeManager);
-						newDt.setName(symbolPath.getName());
-						newDt.setCategoryPath(category);
-						newDt = resolve(newDt);
-						dataTypeManager.replaceDataType(dt, newDt, false);
-						typeApplier.resolvedDataType = newDt;
-					}
-					++renamedCnt;
-				}
-				catch (InvalidNameException | DuplicateNameException
-						| DataTypeDependencyException e) {
-					// unexpected - skip
-					Msg.error(this, "PDB Function definition rename failed: " + dt.getName() +
-						" -> " + symbolPath);
-				}
-			}
-		}
-		if (renamedCnt != 0) {
-			Msg.debug(this, "PDB Renamed " + renamedCnt + " of " + cnt + " function definitions");
-			Category anonymousCategory =
-				dataTypeManager.getCategory(getAnonymousFunctionsCategory());
-			if (anonymousCategory != null) {
-				Msg.debug(this, "PDB Remaining anonymous function definition count: " +
-					anonymousCategory.getDataTypes().length);
-			}
-		}
-
 	}
 
 	//==============================================================================================

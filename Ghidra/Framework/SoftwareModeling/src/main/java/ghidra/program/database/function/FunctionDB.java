@@ -95,6 +95,11 @@ public class FunctionDB extends DatabaseObject implements Function {
 		frame = new FunctionStackFrame(this);
 	}
 
+	@Override
+	public boolean isDeleted() {
+		return isDeleted(manager.lock);
+	}
+
 	public void setValidationEnabled(boolean state) {
 		validateEnabled = state;
 	}
@@ -103,6 +108,12 @@ public class FunctionDB extends DatabaseObject implements Function {
 		thunkedFunction = manager.getThunkedFunction(this);
 		functionSymbol = program.getSymbolTable().getSymbol(key);
 		entryPoint = functionSymbol.getAddress();
+	}
+
+	@Override
+	protected void checkDeleted() {
+		// expose method to function package
+		super.checkDeleted();
 	}
 
 	@Override
@@ -284,8 +295,7 @@ public class FunctionDB extends DatabaseObject implements Function {
 		try {
 			checkIsValid();
 			return manager.getCodeManager()
-					.getComment(CodeUnit.REPEATABLE_COMMENT,
-						getEntryPoint());
+					.getComment(CodeUnit.REPEATABLE_COMMENT, getEntryPoint());
 		}
 		finally {
 			manager.lock.release();
@@ -303,8 +313,7 @@ public class FunctionDB extends DatabaseObject implements Function {
 		try {
 			checkDeleted();
 			manager.getCodeManager()
-					.setComment(getEntryPoint(), CodeUnit.REPEATABLE_COMMENT,
-						comment);
+					.setComment(getEntryPoint(), CodeUnit.REPEATABLE_COMMENT, comment);
 		}
 		finally {
 			manager.lock.release();
@@ -798,9 +807,9 @@ public class FunctionDB extends DatabaseObject implements Function {
 		if (baseType instanceof TypeDef) {
 			baseType = ((TypeDef) baseType).getBaseDataType();
 		}
-		returnParam.setDynamicStorage(
-			(baseType instanceof VoidDataType) ? VariableStorage.VOID_STORAGE
-					: VariableStorage.UNASSIGNED_STORAGE);
+		returnParam
+				.setDynamicStorage((baseType instanceof VoidDataType) ? VariableStorage.VOID_STORAGE
+						: VariableStorage.UNASSIGNED_STORAGE);
 
 		PrototypeModel callingConvention = getCallingConvention();
 		if (callingConvention == null) {
@@ -853,8 +862,7 @@ public class FunctionDB extends DatabaseObject implements Function {
 
 	private void renumberParameterOrdinals() {
 		int ordinal = autoParams != null ? autoParams.size() : 0;
-		for (int i = 0; i < params.size(); i++) {
-			ParameterDB param = params.get(i);
+		for (ParameterDB param : params) {
 			param.setOrdinal(ordinal++);
 		}
 	}
@@ -888,8 +896,8 @@ public class FunctionDB extends DatabaseObject implements Function {
 			}
 		}
 		program.getBookmarkManager()
-				.setBookmark(getEntryPoint(), BookmarkType.ERROR,
-					"Bad Variables Removed", "Removed " + badSymbols.size() + " bad variables");
+				.setBookmark(getEntryPoint(), BookmarkType.ERROR, "Bad Variables Removed",
+					"Removed " + badSymbols.size() + " bad variables");
 		for (Symbol s : badSymbols) {
 			s.delete();
 		}
@@ -1096,21 +1104,18 @@ public class FunctionDB extends DatabaseObject implements Function {
 			loadVariables();
 			ArrayList<Variable> list = new ArrayList<>();
 			if (autoParams != null) {
-				for (int i = 0; i < autoParams.size(); i++) {
-					Parameter p = autoParams.get(i);
+				for (AutoParameterImpl p : autoParams) {
 					if (filter == null || filter.matches(p)) {
 						list.add(p);
 					}
 				}
 			}
-			for (int i = 0; i < params.size(); i++) {
-				Parameter p = params.get(i);
+			for (ParameterDB p : params) {
 				if (filter == null || filter.matches(p)) {
 					list.add(p);
 				}
 			}
-			for (int i = 0; i < locals.size(); i++) {
-				Variable var = locals.get(i);
+			for (VariableDB var : locals) {
 				if (filter == null || filter.matches(var)) {
 					list.add(var);
 				}
@@ -1140,15 +1145,13 @@ public class FunctionDB extends DatabaseObject implements Function {
 			loadVariables();
 			ArrayList<Parameter> list = new ArrayList<>();
 			if (autoParams != null) {
-				for (int i = 0; i < autoParams.size(); i++) {
-					Parameter p = autoParams.get(i);
+				for (AutoParameterImpl p : autoParams) {
 					if (filter == null || filter.matches(p)) {
 						list.add(p);
 					}
 				}
 			}
-			for (int i = 0; i < params.size(); i++) {
-				Parameter p = params.get(i);
+			for (ParameterDB p : params) {
 				if (filter == null || filter.matches(p)) {
 					list.add(p);
 				}
@@ -1176,8 +1179,7 @@ public class FunctionDB extends DatabaseObject implements Function {
 			}
 			loadVariables();
 			ArrayList<Variable> list = new ArrayList<>();
-			for (int i = 0; i < locals.size(); i++) {
-				Variable var = locals.get(i);
+			for (VariableDB var : locals) {
 				if (filter == null || filter.matches(var)) {
 					list.add(var);
 				}
@@ -1657,8 +1659,7 @@ public class FunctionDB extends DatabaseObject implements Function {
 					}
 					if (ordinal != params.size()) {
 						// shift params to make room for inserted param
-						for (int i = 0; i < params.size(); i++) {
-							ParameterDB param = params.get(i);
+						for (ParameterDB param : params) {
 							int paramOrdinal = param.getOrdinal();
 							if (paramOrdinal >= ordinal) {
 								param.setOrdinal(paramOrdinal + 1);
@@ -2708,8 +2709,7 @@ public class FunctionDB extends DatabaseObject implements Function {
 			else {
 				if (program.getCompilerSpec()
 						.getPcodeInjectLibrary()
-						.getPayload(
-							InjectPayload.CALLFIXUP_TYPE, name, null, null) == null) {
+						.getPayload(InjectPayload.CALLFIXUP_TYPE, name) == null) {
 					Msg.warn(this, "Undefined CallFixup set at " + entryPoint + ": " + name);
 				}
 				callFixupMap.add(entryPoint, name);
@@ -2826,8 +2826,7 @@ public class FunctionDB extends DatabaseObject implements Function {
 				tagManager.applyFunctionTag(getID(), tag.getId());
 
 				Address addr = getEntryPoint();
-				program.setChanged(ChangeManager.DOCR_TAG_ADDED_TO_FUNCTION, addr, addr, tag,
-					tag);
+				program.setChanged(ChangeManager.DOCR_TAG_ADDED_TO_FUNCTION, addr, addr, tag, tag);
 			}
 
 			// Add to local cache

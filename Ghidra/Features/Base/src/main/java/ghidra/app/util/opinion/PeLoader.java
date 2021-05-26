@@ -28,6 +28,7 @@ import ghidra.app.util.bin.ByteProvider;
 import ghidra.app.util.bin.format.mz.DOSHeader;
 import ghidra.app.util.bin.format.pe.*;
 import ghidra.app.util.bin.format.pe.ImageCor20Header.ImageCor20Flags;
+import ghidra.app.util.bin.format.pe.ImageRuntimeFunctionEntries._IMAGE_RUNTIME_FUNCTION_ENTRY;
 import ghidra.app.util.bin.format.pe.PortableExecutable.SectionLayout;
 import ghidra.app.util.bin.format.pe.debug.DebugCOFFSymbol;
 import ghidra.app.util.bin.format.pe.debug.DebugDirectoryParser;
@@ -35,6 +36,7 @@ import ghidra.app.util.importer.MessageLog;
 import ghidra.app.util.importer.MessageLogContinuesFactory;
 import ghidra.framework.model.DomainObject;
 import ghidra.framework.options.Options;
+import ghidra.program.database.function.OverlappingFunctionException;
 import ghidra.program.database.mem.FileBytes;
 import ghidra.program.model.address.*;
 import ghidra.program.model.data.*;
@@ -141,11 +143,13 @@ public class PeLoader extends AbstractPeDebugLoader {
 
 			processExports(optionalHeader, program, monitor, log);
 			processImports(optionalHeader, program, monitor, log);
+			processDelayImports(optionalHeader, program, monitor, log);
 			processRelocations(optionalHeader, program, monitor, log);
 			processDebug(optionalHeader, fileHeader, sectionToAddress, program, monitor);
 			processProperties(optionalHeader, program, monitor);
 			processComments(program.getListing(), monitor);
 			processSymbols(fileHeader, sectionToAddress, program, monitor, log);
+			processImageRuntimeFunctionEntries(fileHeader, program, monitor, log);
 
 			processEntryPoints(ntHeader, program, monitor);
 			String compiler = CompilerOpinion.getOpinion(pe, provider).toString();
@@ -246,21 +250,44 @@ public class PeLoader extends AbstractPeDebugLoader {
 				setComment(CodeUnit.EOL_COMMENT, start, section.getName());
 				start = start.add(dt.getLength());
 			}
-
-//			for (int i = 0; i < datadirs.length; ++i) {
-//				if (datadirs[i] == null || datadirs[i].getSize() == 0) {
-//					continue;
-//				}
-//
-//				if (datadirs[i].hasParsedCorrectly()) {
-//					start = datadirs[i].getMarkupAddress(program, true);
-//					dt = datadirs[i].toDataType();
-//					DataUtilities.createData(program, start, dt, true, DataUtilities.ClearDataMode.CHECK_FOR_SPACE);
-//				}
-//			}
 		}
 		catch (Exception e1) {
 			Msg.error(this, "Error laying down header structures " + e1);
+		}
+	}
+
+	private void processImageRuntimeFunctionEntries(FileHeader fileHeader, Program program,
+			TaskMonitor monitor, MessageLog log) {
+
+		// Check to see that we have exception data to process
+		SectionHeader irfeHeader = null;
+		for (SectionHeader header : fileHeader.getSectionHeaders()) {
+			if (header.getName().contains(".pdata")) {
+				irfeHeader = header;
+				break;
+			}
+		}
+
+		if (irfeHeader == null) {
+			return;
+		}
+
+		Address start = program.getImageBase().add(irfeHeader.getVirtualAddress());
+
+		List<_IMAGE_RUNTIME_FUNCTION_ENTRY> irfes = fileHeader.getImageRuntimeFunctionEntries();
+
+		if (irfes.isEmpty()) {
+			return;
+		}
+
+		// TODO: This is x86-64 architecture-specific and needs to be generalized.
+		ImageRuntimeFunctionEntries.createData(program, start, irfes);
+
+		// Each RUNTIME_INFO contains an address to an UNWIND_INFO structure
+		// which also needs to be laid out. When they contain chaining data
+		// they're recursive but the toDataType() function handles that.
+		for (_IMAGE_RUNTIME_FUNCTION_ENTRY entry : irfes) {
+			entry.createData(program);
 		}
 	}
 
@@ -446,6 +473,83 @@ public class PeLoader extends AbstractPeDebugLoader {
 		}
 	}
 
+	private void processDelayImports(OptionalHeader optionalHeader, Program program,
+			TaskMonitor monitor, MessageLog log) {
+
+		if (monitor.isCancelled()) {
+			return;
+		}
+		monitor.setMessage("[" + program.getName() + "]: processing delay imports...");
+
+		DataDirectory[] dataDirectories = optionalHeader.getDataDirectories();
+		if (dataDirectories.length <= OptionalHeader.IMAGE_DIRECTORY_ENTRY_DELAY_IMPORT) {
+			return;
+		}
+
+		DelayImportDataDirectory didd =
+			(DelayImportDataDirectory) dataDirectories[OptionalHeader.IMAGE_DIRECTORY_ENTRY_DELAY_IMPORT];
+		if (didd == null) {
+			return;
+		}
+
+		log.appendMsg("Delay imports detected...");
+
+		AddressSpace space = program.getAddressFactory().getDefaultAddressSpace();
+		Listing listing = program.getListing();
+		ReferenceManager refManager = program.getReferenceManager();
+		FunctionManager funcManager = program.getFunctionManager();
+
+		DelayImportDescriptor[] descriptors = didd.getDelayImportDescriptors();
+		for (DelayImportDescriptor descriptor : descriptors) {
+			if (monitor.isCancelled()) {
+				return;
+			}
+
+			// Get address of the first entry in the import address table
+			Address iatBaseAddr = space.getAddress(descriptor.isUsingRVA()
+					? descriptor.getAddressOfIAT() + optionalHeader.getImageBase()
+					: descriptor.getAddressOfIAT());
+
+			for (ImportInfo importInfo : descriptor.getImportList()) {
+
+				// Get the offset from the import list. -1 is the default (no offset)
+				long offset = importInfo.getAddress();
+				if (offset < 0) {
+					break;
+				}
+
+				// Get address of current position in the import address table
+				Address iatAddr = iatBaseAddr.add(offset);
+				Data iatData = listing.getDataAt(iatAddr);
+				if (iatData == null || !(iatData.getValue() instanceof Address)) {
+					continue;
+				}
+
+				// Create external reference
+				try {
+					refManager.addExternalReference(iatAddr, importInfo.getDLL(),
+						importInfo.getName(), null, SourceType.IMPORTED, 0, RefType.DATA);
+				}
+				catch (DuplicateNameException | InvalidInputException e) {
+					log.appendMsg("Failed to create Delay Load external function at: " + iatAddr);
+				}
+
+				// Create delay load proxy function
+				Address proxyFuncAddr = (Address) iatData.getValue();
+				if (funcManager.getFunctionAt(proxyFuncAddr) == null) {
+					try {
+						funcManager.createFunction("DelayLoad_" + importInfo.getName(),
+							proxyFuncAddr, new AddressSet(proxyFuncAddr), SourceType.IMPORTED);
+					}
+					catch (InvalidInputException | OverlappingFunctionException e) {
+						log.appendMsg(
+							"Failed to create Delay Load proxy function at: " + proxyFuncAddr);
+					}
+				}
+			}
+		}
+	}
+
 	/**
 	 * Mark this location as code in the CodeMap.
 	 * The analyzers will pick this up and disassemble the code.
@@ -515,7 +619,6 @@ public class PeLoader extends AbstractPeDebugLoader {
 		AddressFactory af = program.getAddressFactory();
 		AddressSpace space = af.getDefaultAddressSpace();
 		SymbolTable symTable = program.getSymbolTable();
-		Memory memory = program.getMemory();
 		Listing listing = program.getListing();
 		ReferenceManager refManager = program.getReferenceManager();
 
@@ -593,7 +696,7 @@ public class PeLoader extends AbstractPeDebugLoader {
 
 	private Map<SectionHeader, Address> processMemoryBlocks(PortableExecutable pe, Program prog,
 			FileBytes fileBytes, TaskMonitor monitor, MessageLog log)
-			throws AddressOverflowException, IOException {
+			throws AddressOverflowException {
 
 		AddressFactory af = prog.getAddressFactory();
 		AddressSpace space = af.getDefaultAddressSpace();
